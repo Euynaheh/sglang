@@ -156,7 +156,9 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             cfg.tp_size // cfg.dp_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+        # handle_data_parallelism already resolved this to the per-DP-rank
+        # chunk. Dividing again would admit an undersized workspace.
+        local_chunked_prefill_size = cfg.chunked_prefill_size
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1

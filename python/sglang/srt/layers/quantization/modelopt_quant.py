@@ -64,7 +64,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -2606,7 +2606,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             layer._w13_deinterleaved = True
 
-        if get_moe_a2a_backend().is_megamoe():
+        if (
+            get_moe_a2a_backend().is_megamoe()
+            and not get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             self._build_mega_moe_weights(layer)
             return
 
@@ -2726,6 +2729,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+
+        if (
+            moe_runner_backend.is_flashinfer_megamoe()
+            and get_moe_a2a_backend().is_megamoe()
+        ):
+            from sglang.srt.layers.moe.flashinfer_mega_moe import (
+                finalize_flashinfer_megamoe_weights,
+            )
+
+            finalize_flashinfer_megamoe_weights(
+                layer,
+                max_num_tokens=get_exec().moe.flashinfer_megamoe_max_num_tokens,
+                nvfp4=True,
+            )
+            return
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
@@ -2980,6 +2998,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self._moe_runner_backend = moe_runner_backend
 
         if get_moe_a2a_backend().is_megamoe():
+            if moe_runner_backend.is_flashinfer_megamoe():
+                if not get_platform().is_sm120:
+                    raise ValueError("FlashInfer NVFP4 MegaMoE requires SM120")
+                if (
+                    self.quant_config.use_per_token_activation
+                    or self.quant_config.is_w4a16
+                ):
+                    raise ValueError(
+                        "FlashInfer SM120 NVFP4 MegaMoE requires per-tensor "
+                        "activation scales; per-token activation and W4A16 "
+                        "are not supported"
+                    )
             # FusedMoE.forward is never reached under megamoe.
             self.runner = None
             return

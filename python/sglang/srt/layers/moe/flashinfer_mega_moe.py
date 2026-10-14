@@ -1,4 +1,4 @@
-"""SGLang adapter for FlashInfer's SM120 MXFP4 x MXFP8 MegaMoE backend."""
+"""SGLang adapter for FlashInfer's SM120 W4A8 and NVFP4 MegaMoE backends."""
 
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ class FlashInferMegaMoEAdapter(nn.Module):
         self.layer: Any = None
         self._tensors_cls: Any = None
         self._fast_tensors: Any = None
+        self._scale_tensors: dict[str, torch.Tensor] = {}
         self.handle = id(self)
         _ADAPTERS[self.handle] = self
 
@@ -85,6 +86,11 @@ class FlashInferMegaMoEAdapter(nn.Module):
         w2: torch.Tensor,
         w13_scale: torch.Tensor,
         w2_scale: torch.Tensor,
+        *,
+        input_norm_const: Optional[float] = None,
+        fc1_alpha: Optional[torch.Tensor] = None,
+        fc2_alpha: Optional[torch.Tensor] = None,
+        fc1_norm_const: Optional[torch.Tensor] = None,
     ) -> None:
         self._validate_parallel()
         api = self._api()
@@ -95,11 +101,29 @@ class FlashInferMegaMoEAdapter(nn.Module):
                 "expert partition."
             )
 
+        is_nvfp4 = input_norm_const is not None
+        if is_nvfp4:
+            self._scale_tensors = {
+                "fc1_alpha": fc1_alpha,
+                "fc2_alpha": fc2_alpha,
+                "fc1_norm_const": fc1_norm_const,
+            }
+            for name, value in self._scale_tensors.items():
+                if (
+                    value is None
+                    or value.shape != (self.num_local_experts,)
+                    or value.dtype != torch.float32
+                ):
+                    raise ValueError(
+                        f"NVFP4 {name} must be float32 with shape "
+                        f"({self.num_local_experts},)"
+                    )
+        scale_dtype = torch.float8_e4m3fn if is_nvfp4 else torch.float8_e8m0fnu
         weights = api.PrequantizedMoEWeights(
             w13=_view_byte_dtype(w13, torch.float4_e2m1fn_x2),
             w2=_view_byte_dtype(w2, torch.float4_e2m1fn_x2),
-            w13_scale=_view_byte_dtype(w13_scale, torch.float8_e8m0fnu),
-            w2_scale=_view_byte_dtype(w2_scale, torch.float8_e8m0fnu),
+            w13_scale=_view_byte_dtype(w13_scale, scale_dtype),
+            w2_scale=_view_byte_dtype(w2_scale, scale_dtype),
         )
         bootstrap = api.BootstrapConfig(
             world_size=ep_group.world_size,
@@ -112,11 +136,16 @@ class FlashInferMegaMoEAdapter(nn.Module):
             max_tokens_per_rank=self.max_num_tokens,
             token_hidden_size=self.hidden_size,
         )
-        kernel_cls = api.Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        kernel_cls = (
+            api.Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+            if is_nvfp4
+            else api.Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        )
         kernel_config = kernel_cls(
             intermediate_size=self.intermediate_size,
             top_k=self.top_k,
             gate_up_clamp=self.activation_clamp,
+            **({"input_norm_const": input_norm_const} if is_nvfp4 else {}),
         )
         self.layer = api.MoEEpLayer(
             bootstrap=bootstrap,
@@ -154,6 +183,7 @@ class FlashInferMegaMoEAdapter(nn.Module):
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
                 output=output,
+                **self._scale_tensors,
             )
         else:
             self._fast_tensors.hidden_states = hidden_states
@@ -194,7 +224,9 @@ def flashinfer_megamoe_compute(output: torch.Tensor, handle: int) -> None:
     _lookup_adapter(handle).compute_staged_into(output)
 
 
-def finalize_flashinfer_megamoe_weights(layer, *, max_num_tokens: int) -> None:
+def finalize_flashinfer_megamoe_weights(
+    layer, *, max_num_tokens: int, nvfp4: bool = False
+) -> None:
     if getattr(layer, "flashinfer_megamoe_adapter", None) is not None:
         return
     if layer.num_fused_shared_experts != 0:
@@ -202,6 +234,30 @@ def finalize_flashinfer_megamoe_weights(layer, *, max_num_tokens: int) -> None:
             "FlashInfer MegaMoE requires --disable-shared-experts-fusion; "
             "the shared expert is computed separately."
         )
+    scale_kwargs = {}
+    if nvfp4:
+        if (
+            not layer.moe_runner_config.is_gated
+            or layer.moe_runner_config.activation != "silu"
+        ):
+            raise ValueError("FlashInfer SM120 NVFP4 MegaMoE requires gated SiLU")
+        # The SM120 kernel has one FC1 alpha per expert, shared by gate/up.
+        # Never silently discard a distinct up-projection scale.
+        if not torch.equal(layer.g1_alphas, layer.g1_alphas_up):
+            raise ValueError(
+                "FlashInfer SM120 NVFP4 MegaMoE requires matching gate/up FC1 alphas"
+            )
+        scale_kwargs = {
+            "input_norm_const": float(layer.w13_input_scale_quant),
+            "fc1_alpha": layer.g1_alphas.detach().contiguous(),
+            "fc2_alpha": layer.g2_alphas.detach().contiguous(),
+            "fc1_norm_const": layer.w2_input_scale_quant.detach().contiguous(),
+        }
+    scale_names = (
+        ("w13_weight_scale", "w2_weight_scale")
+        if nvfp4
+        else ("w13_weight_scale_inv", "w2_weight_scale_inv")
+    )
     adapter = FlashInferMegaMoEAdapter(
         num_experts=layer.num_experts,
         num_local_experts=layer.num_local_experts,
@@ -214,16 +270,17 @@ def finalize_flashinfer_megamoe_weights(layer, *, max_num_tokens: int) -> None:
     adapter.finalize_weights(
         layer.w13_weight.data,
         layer.w2_weight.data,
-        layer.w13_weight_scale_inv.data,
-        layer.w2_weight_scale_inv.data,
+        getattr(layer, scale_names[0]).data,
+        getattr(layer, scale_names[1]).data,
+        **scale_kwargs,
     )
     layer.flashinfer_megamoe_adapter = adapter
     # FlashInfer owns the preprocessed weight pack after construction. Drop the
     # loader-side Parameters to avoid retaining a second full expert copy.
     layer.w13_weight = None
     layer.w2_weight = None
-    layer.w13_weight_scale_inv = None
-    layer.w2_weight_scale_inv = None
+    for name in scale_names:
+        setattr(layer, name, None)
     layer._mega_moe_weights_built = True
 
 

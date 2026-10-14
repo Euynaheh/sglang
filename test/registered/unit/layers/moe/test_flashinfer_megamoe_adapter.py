@@ -113,3 +113,31 @@ def test_flashinfer_megamoe_forwards_int32_topk_ids(monkeypatch, num_tokens):
     if num_tokens:
         assert captured["topk_ids"] is topk_ids
     assert captured["compile_tokens_per_rank"] == 3
+
+
+@pytest.mark.parametrize("capacity", [2048, 4095, 4096, 8192])
+def test_flashinfer_megamoe_budget_uses_resolved_dp_chunk(capacity):
+    from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+
+    args = ServerArgs(
+        model_path="dummy",
+        tp_size=4,
+        dp_size=4,
+        enable_dp_attention=True,
+        ep_size=4,
+        moe_runner_backend="flashinfer_megamoe",
+        chunked_prefill_size=16384,
+        flashinfer_megamoe_max_num_tokens=capacity,
+    )
+    args.resolve_once()
+    # Dummy models skip hardware/model hooks. Reproduce the declaration
+    # handle_data_parallelism makes before this validator runs.
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    declare_resolution(args, "_handle_data_parallelism", chunked_prefill_size=4096)
+    assert resolved_view(args).chunked_prefill_size == 4096
+    if capacity < 4096:
+        with pytest.raises(ValueError, match="required_per_rank=4096"):
+            validate_mega_moe_token_budget(args, "DeepseekV4ForCausalLM")
+    else:
+        validate_mega_moe_token_budget(args, "DeepseekV4ForCausalLM")

@@ -222,7 +222,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+    should_skip_scheduler_all_gather,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -1296,7 +1299,8 @@ class Scheduler(
         # Set if a role switch tore down the old role but failed to rebuild
         # either the new or the old role; the instance can no longer serve.
         self._pd_role_switch_unhealthy = False
-        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+        # DP ranks must agree on shutdown before any rank leaves the event loop.
+        self._shutdown_requested = False
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -2368,6 +2372,8 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_shutdown_requested=lambda: self._shutdown_requested,
+            on_shutdown=self._complete_shutdown,
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -5892,9 +5898,23 @@ class Scheduler(
         return None
 
     def handle_shutdown(self, recv_req: ShutdownReq):
-        # Break the event loop; the finally in run_scheduler_process releases resources.
-        self.gracefully_exit = True
+        # Local control messages can arrive in different scheduler iterations.
+        # Keep participating until the existing MLP metadata gather propagates
+        # the shutdown request to every DP rank. TokenizerManager has already
+        # drained requests before sending ShutdownReq.
+        self._shutdown_requested = True
+        if (
+            not self.require_mlp_sync
+            or self._engine_paused
+            or should_skip_scheduler_all_gather(get_parallel().dp_size)
+        ):
+            # Independent/paused schedulers have no MLP metadata gather to wait for.
+            self._complete_shutdown()
         return None
+
+    def _complete_shutdown(self):
+        # The event loop finishes this iteration before releasing resources.
+        self.gracefully_exit = True
 
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:

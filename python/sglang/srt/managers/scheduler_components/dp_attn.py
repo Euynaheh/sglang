@@ -100,6 +100,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    shutdown_requested: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -120,6 +121,7 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
+                int(self.shutdown_requested),
             ],
             device=device,
             dtype=dtype,
@@ -136,6 +138,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
+                0,  # shutdown_requested (inactive ranks do not request shutdown)
             ],
             device=device,
             dtype=dtype,
@@ -218,6 +221,7 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
+        self.shutdown_requested = bool(tp0_info_cpu[:, 8].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -376,6 +380,8 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    shutdown_requested: bool = False,
+    on_shutdown: Optional[Callable[[], None]] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -472,6 +478,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        shutdown_requested=shutdown_requested,
     )
 
     if dp_size == 1:
@@ -482,6 +489,11 @@ def prepare_mlp_sync_batch_raw(
             group=group,
             use_all_reduce=use_world_group,
         )
+
+    # Piggyback on the existing gather, including globally idle iterations.
+    # No extra collective or device-to-host transfer is needed for shutdown.
+    if mlp_sync_info.shutdown_requested and on_shutdown is not None:
+        on_shutdown()
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
     if metadata_ready:
@@ -542,6 +554,8 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_shutdown_requested: Callable[[], bool] = lambda: False
+    on_shutdown: Optional[Callable[[], None]] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -557,6 +571,8 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            shutdown_requested=self.get_shutdown_requested(),
+            on_shutdown=self.on_shutdown,
         )
 
     def maybe_prepare_mlp_sync_batch(
