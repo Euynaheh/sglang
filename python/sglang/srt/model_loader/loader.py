@@ -258,11 +258,28 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
-                # Draft experts serialized under mtp.* remain source MXFP4.
-                # NextN exposes them as model.decoder.*; DSpark as stages.*.
+                # Legacy target checkpoints leave mtp.* experts in MXFP4;
+                # bundled NVFP4 DSpark checkpoints quantize the draft too.
+                # NextN exposes draft experts as model.decoder.*, DSpark as
+                # stages.*. Only exclude those names for an MXFP4 draft.
+                checkpoint_quant = getattr(
+                    model_config.hf_config, "quantization_config", None
+                )
+                if hasattr(checkpoint_quant, "to_dict"):
+                    checkpoint_quant = checkpoint_quant.to_dict()
+                serialized_draft_nvfp4 = any(
+                    name.startswith("mtp.")
+                    and isinstance(info, dict)
+                    and str(info.get("quant_algo", "")).upper() == "NVFP4"
+                    for name, info in (
+                        (checkpoint_quant or {}).get("quantized_layers") or {}
+                    ).items()
+                )
                 nvfp4_exclude_modules = list(
                     nvfp4_meta.get("exclude_modules") or []
-                ) + ["model.decoder.*", "stages.*"]
+                )
+                if not serialized_draft_nvfp4:
+                    nvfp4_exclude_modules += ["model.decoder.*", "stages.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),

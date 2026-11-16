@@ -3508,6 +3508,16 @@ class DeepseekSparseAttnBackend(
         )
 
         assert self.workspace_buffer is not None
+        if self.dsa_index_kpool > 1:
+            # KPool leaves -1 holes between history and appended tail slots.
+            # Pooled sequence length is not a prefix bound on this slot list.
+            # Consume the full list, relying on its -1 validity masks, then
+            # pad with -1 to a whole 128-column SM120 prefill tile.
+            width = page_table_1.shape[1]
+            pad = (-width) % 128
+            if pad:
+                page_table_1 = torch.nn.functional.pad(page_table_1, (0, pad), value=-1)
+            seq_lens = None
         return flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,

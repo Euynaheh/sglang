@@ -49,6 +49,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             and not self.dsa_kv_cache_store_fp8
         ):
             return
+        if (dsa_impl == "flashinfer_sparse_mla" and self.device_sm_major == 12
+                and self.qk_rope_head_dim == 0 and self.dsa_kv_cache_store_fp8):
+            return  # Packed NoPE bridge preserves all history and tail slots.
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1

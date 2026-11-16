@@ -608,8 +608,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @__import__("contextlib").contextmanager
     def _draft_context(self):
-        return draft_tp_context(self.draft_parallel_layout)
+        from sglang.srt.layers.moe.utils import speculative_moe_backend_context, speculative_moe_a2a_backend_context
+        with draft_tp_context(self.draft_parallel_layout), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            yield
 
     def alloc_memory_pool(
         self,
