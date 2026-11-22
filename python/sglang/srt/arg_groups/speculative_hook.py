@@ -732,7 +732,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 and cfg.moe_runner_backend == "flashinfer_megamoe"
                 and cfg.speculative_moe_a2a_backend == "none"
                 and cfg.speculative_moe_runner_backend == "flashinfer_mxfp4"
-                and cfg.attn_dp_size == cfg.tp_size and cfg.tp_size in (4, 8)
+                and cfg.attn_dp_size == cfg.tp_size and cfg.tp_size in (4, 8, 16)
             )
         ):
             raise ValueError(
